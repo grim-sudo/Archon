@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
@@ -34,6 +35,47 @@ from typing import Any
 from ..utils.logger import get_logger
 
 logger = get_logger("Privilege")
+
+# Hard cap on any single subprocess. A command with no TTY that hits an
+# interactive prompt (debconf/whiptail inside a chroot, a su/gpg prompt) blocks
+# forever and silently — a 68-minute stall with no output before. Capping every
+# command turns that hang into a loud failure the caller can retry or skip.
+# ponytail: a flat per-command cap; the longest real operation is an apt install
+# of the live-boot stack, which must stay under it or be given its own budget.
+CMD_TIMEOUT = int(os.environ.get("ARCHON_BUILD_CMD_TIMEOUT", "1800"))
+
+
+def run_with_timeout(
+    cmd: list[str], *, input_text: str | None = None, **kwargs: Any
+) -> subprocess.CompletedProcess:
+    """``subprocess.run`` that kills the whole process group on timeout.
+
+    ``start_new_session=True`` detaches the child into its own process group so a
+    timeout can kill the entire tree (sudo → chroot → apt-get → whiptail) rather
+    than just the direct child, which would otherwise be orphaned still holding
+    the pipes open. Returns exit code 124 (timeout's conventional code) on
+    expiry so callers treat it as a normal non-zero failure.
+    """
+    # ``capture_output`` is a run()-only kwarg; Popen needs explicit pipes. We
+    # always capture, since the caller returns combined output for the build log.
+    kwargs.pop("capture_output", None)
+    kwargs.setdefault("stdout", subprocess.PIPE)
+    kwargs.setdefault("stderr", subprocess.PIPE)
+    kwargs.setdefault("text", True)
+    proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(input=input_text, timeout=CMD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        stdout, stderr = "", ""
+        with contextlib.suppress(Exception):
+            stdout, stderr = proc.communicate(timeout=30)
+        logger.error(
+            "Command timed out after {}s: {}", CMD_TIMEOUT, " ".join(cmd)[:200]
+        )
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 # provider(reason) -> password, or None if the user cancels/declines.
 PasswordProvider = Callable[[str], "str | None"]
@@ -54,12 +96,17 @@ class _Session:
 
         ``-k`` ignores any cached sudo timestamp so behavior is deterministic;
         ``-p ''`` suppresses sudo's own prompt (we supply the password on stdin).
+
+        NOTE: sudo resets the environment (``env_reset`` in sudoers), so any
+        ``env=`` the caller passes here is stripped before the target command
+        sees it. Variables the *target* needs must be set in its argv (e.g. an
+        ``env VAR=val`` prefix), not via this kwarg.
         """
         kwargs.setdefault("capture_output", True)
         kwargs.setdefault("text", True)
-        return subprocess.run(
+        return run_with_timeout(
             ["sudo", "-S", "-k", "-p", "", *argv],
-            input=self._password + "\n",
+            input_text=self._password + "\n",
             **kwargs,
         )
 
@@ -142,11 +189,9 @@ class PrivilegeEscalator:
         # Validate the password once up front so a long operation fails fast on a
         # bad password rather than mid-build.
         try:
-            check = subprocess.run(
+            check = run_with_timeout(
                 ["sudo", "-S", "-k", "-p", "", "true"],
-                input=password + "\n",
-                capture_output=True,
-                text=True,
+                input_text=password + "\n",
             )
         except Exception as exc:  # noqa: BLE001
             raise PrivilegeError(f"Could not invoke sudo for {reason}: {exc}") from exc

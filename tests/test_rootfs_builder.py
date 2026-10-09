@@ -196,7 +196,9 @@ def test_apt_install_retries_individually_and_reports_failures(monkeypatch):
 
     def fake_run_logged(cmd, cwd=None, env=None):
         calls.append(cmd)
-        pkgs = cmd[cmd.index("--no-install-recommends") + 1 :]
+        # The package list is whatever follows the last apt option flag.
+        cut = cmd.index("Dpkg::Options::=--force-confold") + 1
+        pkgs = cmd[cut:]
         if len(pkgs) > 1:
             return False, "batch abort"  # transaction aborts on the missing name
         return ("burpsuite" not in pkgs), ""
@@ -210,6 +212,37 @@ def test_apt_install_retries_individually_and_reports_failures(monkeypatch):
     assert failed == ["burpsuite"]
     # Batch attempt + one per-package attempt each.
     assert len(calls) == 1 + 3
+
+
+def test_chroot_cmd_sets_noninteractive_debconf_past_sudo(tmp_path):
+    """Regression: debconf must never fall back to whiptail inside the chroot.
+
+    The build runs privileged commands through ``sudo``, which resets the
+    environment (``env_reset`` in sudoers). Setting DEBIAN_FRONTEND via the
+    runner's ``env=`` therefore never reaches apt-get, and a package with a
+    config template (wireshark-common) opens a whiptail dialog on a stdin that
+    ``sudo -S`` already consumed — no TTY behind it, so the build hangs forever.
+    The variable must therefore be set in the target command's own argv.
+    """
+    argv = rb._chroot_cmd(tmp_path)
+
+    assert argv[:2] == ["chroot", str(tmp_path)]
+    # Set as env-assignment arguments for the chrooted command, not via env=.
+    assert "DEBIAN_FRONTEND=noninteractive" in argv
+    assert "DEBCONF_NONINTERACTIVE_SEEN=true" in argv
+    # Before whatever command follows, so it is inherited by apt-get.
+    assert argv.index("DEBIAN_FRONTEND=noninteractive") < len(argv) - 1
+
+
+def test_apt_install_passes_dpkg_noninteractive_options(monkeypatch):
+    """dpkg must not stop for conffile input either — same no-TTY hang class."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(rb, "_run_logged", lambda cmd, cwd=None, env=None: (seen.append(cmd), (True, ""))[1])
+
+    rb._apt_install(["chroot", "/r"], ["nmap"], {})
+
+    assert "Dpkg::Options::=--force-confdef" in seen[0]
+    assert "Dpkg::Options::=--force-confold" in seen[0]
 
 
 def test_kali_repo_setup_writes_pinned_source_and_key(monkeypatch, tmp_path):

@@ -457,7 +457,7 @@ Automation/
 ├── ui-tauri/                     Desktop command center (Tauri v2 + Vite + TypeScript)
 ├── userguide.md                  End-to-end user guide (every interface and flag)
 ├── docs/                         usage.md
-└── tests/                        pytest suite (460 tests)
+└── tests/                        pytest suite (465 tests)
 ```
 
 **Entry points**
@@ -520,7 +520,7 @@ workflows = asyncio.run(mgr.list_workflows())
 ```bash
 pip install -e ".[dev]"
 
-# Run the test suite (460 tests)
+# Run the test suite (465 tests)
 pytest tests/ -v -m "not integration and not slow"
 
 # Lint, format, and type-check

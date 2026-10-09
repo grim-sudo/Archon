@@ -164,6 +164,10 @@ def _run_logged(
 
     When not root but a sudo-escalation session is active, the command runs
     through ``sudo -S`` transparently so the whole build can complete.
+
+    Both branches go through :func:`run_with_timeout`, so a command that blocks
+    on an interactive prompt with no TTY is killed (process group and all) and
+    reported as a failure instead of stalling the build indefinitely.
     """
     logger.debug("Running: {}", " ".join(cmd))
     session = None
@@ -178,13 +182,9 @@ def _run_logged(
     if session is not None:
         result = session.run(cmd, cwd=cwd, env=run_env)
     else:
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            env=run_env,
-        )
+        from ..security.privilege import run_with_timeout
+
+        result = run_with_timeout(cmd, cwd=cwd, env=run_env)
     output = (result.stdout or "") + "\n" + (result.stderr or "")
     if result.returncode != 0:
         logger.error("Command failed (exit {}):\n{}", result.returncode, result.stderr[:500])
@@ -251,6 +251,39 @@ def _umount_chroot_binds(mounted: list[str]) -> None:
         _run_logged(["umount", "-l", target])
 
 
+def _chroot_cmd(rootfs_path: Path) -> list[str]:
+    """Chroot argv with the non-interactive debconf frontend baked into it.
+
+    ``DEBIAN_FRONTEND=noninteractive`` is set here, in the *target* command's
+    argv, rather than passed as an ``env=`` to the runner. That distinction is the
+    whole point: privileged commands go through ``sudo``, which resets the
+    environment (``env_reset`` in sudoers is on by default), so a variable set in
+    Archon's own environment is stripped before ``apt-get`` ever sees it. debconf
+    then falls back to its default whiptail frontend, and a package with a
+    config template (``wireshark-common``) prompts on a stdin that ``sudo -S``
+    already consumed — with no TTY behind it, blocking the build forever.
+
+    ``DEBCONF_NONINTERACTIVE_SEEN`` tells debconf the dialogs are already dealt
+    with, so a later ``apt-get`` in the same rootfs doesn't re-prompt.
+
+    ``/usr/bin/env`` is coreutils, always present in a debootstrap base.
+    """
+    return [
+        "chroot", str(rootfs_path), "/usr/bin/env",
+        "DEBIAN_FRONTEND=noninteractive",
+        "DEBCONF_NONINTERACTIVE_SEEN=true",
+    ]
+
+
+# apt/dpkg must never stop for input. These keep dpkg on the recorded conffile
+# defaults instead of opening an editor/prompt with no TTY — the same hang class
+# as the debconf dialog above, at the dpkg layer.
+_APT_NONINTERACTIVE = [
+    "-o", "Dpkg::Options::=--force-confdef",
+    "-o", "Dpkg::Options::=--force-confold",
+]
+
+
 def _apt_install(chroot: list[str], pkgs: list[str], env: dict) -> tuple[bool, list[str]]:
     """Install *pkgs* in the chroot resiliently; return (all_ok, failed).
 
@@ -262,7 +295,7 @@ def _apt_install(chroot: list[str], pkgs: list[str], env: dict) -> tuple[bool, l
     """
     if not pkgs:
         return True, []
-    base = chroot + ["apt-get", "install", "-y", "--no-install-recommends"]
+    base = chroot + ["apt-get", "install", "-y", "--no-install-recommends"] + _APT_NONINTERACTIVE
     ok, _ = _run_logged(base + pkgs, env=env)
     if ok:
         return True, []
@@ -283,7 +316,7 @@ def _setup_kali_repo(rootfs_path: Path, env: dict) -> bool:
     veracrypt, …). This keeps the base stable while making the security toolset
     installable. Requires ca-certificates/gnupg/curl already in the chroot.
     """
-    chroot = ["chroot", str(rootfs_path)]
+    chroot = _chroot_cmd(rootfs_path)
     apt = rootfs_path / "etc" / "apt"
     ok_list, _ = _install_file(
         "deb http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\n",
@@ -358,7 +391,7 @@ async def build_debian_rootfs(profile: DistroProfile, rootfs_path: Path) -> bool
     # ── chroot setup ──────────────────────────────────────────────────────────
     # The rootfs is root-owned (debootstrap ran as root), so config files must be
     # written through the privilege session, not with a direct Path.write_text.
-    chroot = ["chroot", str(rootfs_path)]
+    chroot = _chroot_cmd(rootfs_path)
 
     # Set hostname
     await asyncio.to_thread(
@@ -420,7 +453,7 @@ async def build_debian_rootfs(profile: DistroProfile, rootfs_path: Path) -> bool
         logger.info("Installing {} live/base packages …", len(live_pkgs))
         infra_ok, _ = await asyncio.to_thread(
             _run_logged,
-            chroot + ["apt-get", "install", "-y", "--no-install-recommends", *live_pkgs],
+            chroot + ["apt-get", "install", "-y", "--no-install-recommends", *_APT_NONINTERACTIVE, *live_pkgs],
             env=env,
         )
         if not infra_ok:

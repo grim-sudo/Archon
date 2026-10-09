@@ -11,6 +11,7 @@ import subprocess
 from unittest.mock import patch
 
 import pytest
+from archon.security import privilege
 from archon.security.privilege import PrivilegeError, PrivilegeEscalator
 
 
@@ -51,7 +52,7 @@ def test_session_prompts_once_and_password_not_retained():
     esc = PrivilegeEscalator(provider=lambda reason: calls.append(reason) or "secret")
     with patch.object(PrivilegeEscalator, "is_root", staticmethod(lambda: False)), patch.object(
         PrivilegeEscalator, "sudo_available", staticmethod(lambda: True)
-    ), patch("subprocess.run", return_value=_completed(returncode=0)) as run:
+    ), patch("archon.security.privilege.run_with_timeout", return_value=_completed(returncode=0)) as run:
         assert esc.active_session is None
         with esc.session("build") as sess:
             assert sess is not None
@@ -66,7 +67,7 @@ def test_session_prompts_once_and_password_not_retained():
         assert esc.active_session is None
         # The validation call fed the password on stdin to `sudo -S`.
         _, kwargs = run.call_args
-        assert kwargs.get("input", "").startswith("secret")
+        assert kwargs.get("input_text", "").startswith("secret")
 
 
 def test_root_yields_no_session_and_runs_directly():
@@ -85,10 +86,64 @@ def test_session_run_prefixes_sudo():
     esc = PrivilegeEscalator(provider=lambda reason: "pw")
     with patch.object(PrivilegeEscalator, "is_root", staticmethod(lambda: False)), patch.object(
         PrivilegeEscalator, "sudo_available", staticmethod(lambda: True)
-    ), patch("subprocess.run", return_value=_completed(returncode=0)) as run:
+    ), patch("archon.security.privilege.run_with_timeout", return_value=_completed(returncode=0)) as run:
         with esc.session("op") as sess:
             sess.run(["pacstrap", "/mnt"])
         # Last call is the real command, prefixed with sudo -S.
         argv = run.call_args[0][0]
         assert argv[:2] == ["sudo", "-S"]
         assert "pacstrap" in argv
+
+
+def test_run_with_timeout_kills_the_process_group():
+    """A command blocked on a prompt must be killed, not waited on forever.
+
+    This is the defence-in-depth behind the wireshark hang: with no TTY, any
+    interactive prompt (debconf/whiptail, su, gpg) blocks indefinitely and the
+    build stalls with no output. The child is started in its own session so the
+    timeout kills the whole tree (sudo → chroot → apt-get → whiptail) rather than
+    orphaning the grandchild still holding the pipes.
+    """
+    import sys
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(privilege, "CMD_TIMEOUT", 1)
+    try:
+        result = privilege.run_with_timeout(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+    finally:
+        monkey.undo()
+
+    # 124 is the conventional timeout exit code.
+    assert result.returncode == 124
+
+
+def test_run_with_timeout_passes_through_success():
+    import sys
+
+    result = privilege.run_with_timeout(
+        [sys.executable, "-c", "print('hello')"]
+    )
+    assert result.returncode == 0
+    assert "hello" in result.stdout
+
+
+def test_session_run_does_not_rely_on_env_for_target_variables():
+    """sudo resets the environment — `env=` is NOT how a target gets a var.
+
+    Documents the trap behind the 68-minute build hang: DEBIAN_FRONTEND passed
+    via `env=` is silently stripped at the sudo boundary, so debconf falls back
+    to whiptail. The variable must be baked into the argv instead — see
+    ``rootfs_builder._chroot_cmd``.
+    """
+    esc = PrivilegeEscalator(provider=lambda reason: "pw")
+    with patch.object(PrivilegeEscalator, "is_root", staticmethod(lambda: False)), patch.object(
+        PrivilegeEscalator, "sudo_available", staticmethod(lambda: True)
+    ), patch("archon.security.privilege.run_with_timeout", return_value=_completed(returncode=0)) as run:
+        with esc.session("op") as sess:
+            sess.run(["chroot", "/rootfs", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "wireshark"])
+        argv = run.call_args[0][0]
+        # The value rides in argv (after sudo), so env_reset cannot strip it.
+        assert argv[:2] == ["sudo", "-S"]
+        assert "DEBIAN_FRONTEND=noninteractive" in argv
